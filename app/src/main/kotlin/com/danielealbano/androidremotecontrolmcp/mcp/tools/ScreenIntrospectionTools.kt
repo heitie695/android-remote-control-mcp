@@ -72,6 +72,8 @@ class GetScreenStateHandler
 
         suspend fun execute(arguments: JsonObject?): CallToolResult {
             val includeScreenshot = parseIncludeScreenshot(arguments)
+            val annotate = arguments?.get("annotate")?.jsonPrimitive?.booleanOrNull ?: true
+            val highRes = arguments?.get("high_res")?.jsonPrimitive?.booleanOrNull ?: false
             val cursorElement = arguments?.get("cursor")
             // Absent, JSON null, or a blank string ⇒ fresh cursorless capture (settled behavior 1).
             // A present, non-blank value (INCLUDING a non-primitive object/array) ⇒ paged path,
@@ -81,7 +83,7 @@ class GetScreenStateHandler
                     cursorElement is JsonNull ||
                     ((cursorElement as? JsonPrimitive)?.contentOrNull?.isBlank() == true)
             return if (isFresh) {
-                handleFreshRequest(includeScreenshot)
+                handleFreshRequest(includeScreenshot, annotate, highRes)
             } else {
                 McpToolUtils.untrustedTextResult(buildPagedText(cursorElement, includeScreenshot))
             }
@@ -94,7 +96,11 @@ class GetScreenStateHandler
                 false
             }
 
-        private suspend fun handleFreshRequest(includeScreenshot: Boolean): CallToolResult {
+        private suspend fun handleFreshRequest(
+            includeScreenshot: Boolean,
+            annotate: Boolean = true,
+            highRes: Boolean = false,
+        ): CallToolResult {
             // getFreshWindows clears the framework accessibility cache before reading (see there),
             // so this fresh capture — and the node cache it populates for element/action tools —
             // round-trips live even for stale-prone WebView content.
@@ -111,9 +117,12 @@ class GetScreenStateHandler
             val totalKept = compactTreeFormatter.countKeptNodes(result)
             val totalPages = ceilDiv(totalKept, CompactTreeFormatter.PAGE_SIZE)
             val compactOutput = buildFreshPageText(result, screenInfo, totalKept, totalPages)
-            Log.d(TAG, "get_screen_state: includeScreenshot=$includeScreenshot pages=$totalPages")
+            Log.d(
+                TAG,
+                "get_screen_state: includeScreenshot=$includeScreenshot pages=$totalPages annotate=$annotate highRes=$highRes",
+            )
             return if (includeScreenshot) {
-                buildScreenshotResult(result, screenInfo, compactOutput, processed.flaggedBounds)
+                buildScreenshotResult(result, screenInfo, compactOutput, processed.flaggedBounds, annotate, highRes)
             } else {
                 McpToolUtils.untrustedTextResult(compactOutput)
             }
@@ -184,6 +193,8 @@ class GetScreenStateHandler
             screenInfo: ScreenInfo,
             compactOutput: String,
             flaggedBounds: List<BoundsData>,
+            annotate: Boolean = true,
+            highRes: Boolean = false,
         ): CallToolResult {
             if (!screenCaptureProvider.isScreenCaptureAvailable()) {
                 throw McpToolException.PermissionDenied(
@@ -192,10 +203,11 @@ class GetScreenStateHandler
                 )
             }
 
+            val maxSize = if (highRes) SCREENSHOT_HIGH_RES_SIZE else SCREENSHOT_MAX_SIZE
             val bitmapResult =
                 screenCaptureProvider.captureScreenshotBitmap(
-                    maxWidth = SCREENSHOT_MAX_SIZE,
-                    maxHeight = SCREENSHOT_MAX_SIZE,
+                    maxWidth = maxSize,
+                    maxHeight = maxSize,
                 )
             val resizedBitmap =
                 bitmapResult.getOrElse { exception ->
@@ -210,23 +222,30 @@ class GetScreenStateHandler
                 screenshotRedactor.mask(resizedBitmap, flaggedBounds, screenInfo.width, screenInfo.height)
             var annotatedBitmap: Bitmap? = null
             try {
-                // Collect on-screen elements from ALL windows' trees
-                val onScreenElements = collectOnScreenElements(result.windows)
+                val finalBitmap =
+                    if (annotate) {
+                        // Collect on-screen elements from ALL windows' trees
+                        val onScreenElements = collectOnScreenElements(result.windows)
 
-                // Annotate the (masked) screenshot with bounding boxes
-                annotatedBitmap =
-                    screenshotAnnotator.annotate(
-                        maskedBitmap,
-                        onScreenElements,
-                        screenInfo.width,
-                        screenInfo.height,
-                    )
+                        // Annotate the (masked) screenshot with bounding boxes
+                        annotatedBitmap =
+                            screenshotAnnotator.annotate(
+                                maskedBitmap,
+                                onScreenElements,
+                                screenInfo.width,
+                                screenInfo.height,
+                            )
+                        annotatedBitmap
+                    } else {
+                        maskedBitmap
+                    }
 
-                // Encode annotated bitmap to base64 JPEG
+                // Encode bitmap to base64 JPEG
+                val quality = if (highRes) HIGH_RES_QUALITY else ScreenCaptureProvider.DEFAULT_QUALITY
                 val screenshotData =
                     screenshotEncoder.bitmapToScreenshotData(
-                        annotatedBitmap,
-                        ScreenCaptureProvider.DEFAULT_QUALITY,
+                        finalBitmap,
+                        quality,
                     )
 
                 return McpToolUtils.untrustedTextAndImageResult(
@@ -237,9 +256,9 @@ class GetScreenStateHandler
             } catch (e: McpToolException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Screenshot annotation failed", e)
+                Log.e(TAG, "Screenshot processing failed", e)
                 throw McpToolException.ActionFailed(
-                    "Screenshot annotation failed",
+                    "Screenshot processing failed",
                 )
             } finally {
                 annotatedBitmap?.recycle()
@@ -301,8 +320,25 @@ class GetScreenStateHandler
                                         put("type", "boolean")
                                         put(
                                             "description",
-                                            "Include a low-resolution screenshot. " +
-                                                "Only request when the UI node list is not sufficient.",
+                                            "Include a screenshot. Only request when the UI node list is not sufficient.",
+                                        )
+                                        put("default", false)
+                                    }
+                                    putJsonObject("annotate") {
+                                        put("type", "boolean")
+                                        put(
+                                            "description",
+                                            "Whether to annotate the screenshot with bounding boxes and node IDs. " +
+                                                "Set to false to return a clean, unannotated screenshot. Defaults to true.",
+                                        )
+                                        put("default", true)
+                                    }
+                                    putJsonObject("high_res") {
+                                        put("type", "boolean")
+                                        put(
+                                            "description",
+                                            "Whether to capture in high resolution (1440px) instead of 700px. " +
+                                                "Defaults to false.",
                                         )
                                         put("default", false)
                                     }
@@ -327,6 +363,8 @@ class GetScreenStateHandler
         companion object {
             const val TOOL_NAME = "get_screen_state"
             internal const val SCREENSHOT_MAX_SIZE = 700
+            internal const val SCREENSHOT_HIGH_RES_SIZE = 1440
+            internal const val HIGH_RES_QUALITY = 90
             private const val TAG = "MCP:ScreenIntrospection"
             internal const val CURSOR_RADIX = 36
             internal const val INVALID_CURSOR_MESSAGE =

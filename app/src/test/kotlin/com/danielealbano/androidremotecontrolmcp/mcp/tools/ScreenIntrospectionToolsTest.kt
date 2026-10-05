@@ -278,6 +278,65 @@ class ScreenIntrospectionToolsTest {
             }
 
         @Test
+        @DisplayName("screenshot skips annotation when annotate is false")
+        fun screenshotSkipsAnnotationWhenAnnotateIsFalse() =
+            runTest {
+                setupReadyService()
+                every { mockScreenCaptureProvider.isScreenCaptureAvailable() } returns true
+                val mockBitmap = mockk<Bitmap>(relaxed = true)
+                coEvery {
+                    mockScreenCaptureProvider.captureScreenshotBitmap(any(), any())
+                } returns Result.success(mockBitmap)
+                every {
+                    mockScreenshotEncoder.bitmapToScreenshotData(any(), any())
+                } returns ScreenshotData(data = "base64data", width = 700, height = 500)
+
+                val params = buildJsonObject {
+                    put("include_screenshot", true)
+                    put("annotate", false)
+                }
+                handler.execute(params)
+
+                verify(exactly = 0) {
+                    mockScreenshotAnnotator.annotate(any(), any(), any(), any())
+                }
+                verify(exactly = 1) {
+                    mockScreenshotEncoder.bitmapToScreenshotData(mockBitmap, ScreenCaptureProvider.DEFAULT_QUALITY)
+                }
+            }
+
+        @Test
+        @DisplayName("screenshot uses high resolution when high_res is true")
+        fun screenshotUsesHighResWhenHighResIsTrue() =
+            runTest {
+                setupReadyService()
+                every { mockScreenCaptureProvider.isScreenCaptureAvailable() } returns true
+                val mockBitmap = mockk<Bitmap>(relaxed = true)
+                coEvery {
+                    mockScreenCaptureProvider.captureScreenshotBitmap(any(), any())
+                } returns Result.success(mockBitmap)
+                every {
+                    mockScreenshotEncoder.bitmapToScreenshotData(any(), any())
+                } returns ScreenshotData(data = "base64data", width = 1440, height = 1080)
+
+                val params = buildJsonObject {
+                    put("include_screenshot", true)
+                    put("high_res", true)
+                }
+                handler.execute(params)
+
+                coVerify(exactly = 1) {
+                    mockScreenCaptureProvider.captureScreenshotBitmap(
+                        GetScreenStateHandler.SCREENSHOT_HIGH_RES_SIZE,
+                        GetScreenStateHandler.SCREENSHOT_HIGH_RES_SIZE,
+                    )
+                }
+                verify(exactly = 1) {
+                    mockScreenshotEncoder.bitmapToScreenshotData(any(), GetScreenStateHandler.HIGH_RES_QUALITY)
+                }
+            }
+
+        @Test
         @DisplayName("does not include screenshot by default")
         fun doesNotIncludeScreenshotByDefault() =
             runTest {
